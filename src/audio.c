@@ -13,7 +13,8 @@
  */
 
 #define AERON_AUDIO_DEVICE_RATE 48000
-#define AERON_AUDIO_DEVICE_CHANNELS 2
+#define AERON_AUDIO_DEFAULT_CHANNELS 2
+#define AERON_AUDIO_MAX_CHANNELS 8
 #define AERON_AUDIO_MAX_CLIPS 2048
 #define AERON_AUDIO_MAX_VOICES 96
 #define AERON_AUDIO_MAX_STREAMS 8
@@ -76,6 +77,7 @@ typedef struct AeronAudioSystem {
 	int               initialized;
 	SDL_AudioStream*  device; /* output device stream */
 	SDL_AudioDeviceID device_id;
+	int               device_channels; /* SDL layout order: FL FR [FC LFE] BL BR [SL SR] */
 	int               device_buffer_input_frames;
 	int               device_paused;
 	uint64_t          device_paused_ns;
@@ -94,8 +96,8 @@ typedef struct AeronAudioSystem {
 	float              rolloff_factor;
 	float              doppler_factor;
 
-	float   mix[AERON_AUDIO_MIX_CHUNK * 2];
-	int16_t stage[AERON_AUDIO_MIX_CHUNK * 2];
+	float   mix[AERON_AUDIO_MIX_CHUNK * AERON_AUDIO_MAX_CHANNELS];
+	int16_t stage[AERON_AUDIO_MIX_CHUNK * AERON_AUDIO_MAX_CHANNELS];
 } AeronAudioSystem;
 
 static AeronAudioSystem g_audio;
@@ -118,7 +120,7 @@ static uint64_t Aeron_AudioPlayedOutputFramesLocked(void) {
 	int      queued  = SDL_GetAudioStreamQueued(g_audio.device);
 	uint64_t pending = (uint64_t)g_audio.device_buffer_input_frames;
 	if (queued > 0) {
-		pending += (unsigned int)queued / (AERON_AUDIO_DEVICE_CHANNELS * sizeof(int16_t));
+		pending += (unsigned int)queued / ((unsigned int)g_audio.device_channels * sizeof(int16_t));
 	}
 	return g_audio.submitted_frames > pending ? g_audio.submitted_frames - pending : 0;
 }
@@ -347,8 +349,8 @@ static void Aeron_AudioMixVoice(AeronVoiceSlot* voice, int frames) {
 			left       = mono * gl;
 			right      = mono * gr;
 		}
-		g_audio.mix[mixed * 2] += left;
-		g_audio.mix[mixed * 2 + 1] += right;
+		g_audio.mix[mixed * g_audio.device_channels] += left;
+		g_audio.mix[mixed * g_audio.device_channels + 1] += right;
 		voice->pos += step;
 		voice->advanced += step;
 	}
@@ -406,18 +408,117 @@ static float Aeron_AudioSampleStream(const AeronAudioStreamSlot* stream, uint64_
 	return (float)((const int16_t*)stream->pcm)[index * (size_t)stream->channels + (size_t)channel];
 }
 
+/* Speaker positions in SDL's channel order for the supported layouts. */
+enum {
+	AERON_SPEAKER_FL,
+	AERON_SPEAKER_FR,
+	AERON_SPEAKER_FC,
+	AERON_SPEAKER_LFE,
+	AERON_SPEAKER_BL,
+	AERON_SPEAKER_BR,
+	AERON_SPEAKER_SL,
+	AERON_SPEAKER_SR,
+	AERON_SPEAKER_COUNT
+};
+
+static int Aeron_AudioLayoutSupported(int channels) {
+	return channels == 1 || channels == 2 || channels == 4 || channels == 6 || channels == 8;
+}
+
+static const int* Aeron_AudioLayoutSpeakers(int channels) {
+	static const int mono[]   = { AERON_SPEAKER_FC };
+	static const int stereo[] = { AERON_SPEAKER_FL, AERON_SPEAKER_FR };
+	static const int quad[]   = { AERON_SPEAKER_FL, AERON_SPEAKER_FR, AERON_SPEAKER_BL, AERON_SPEAKER_BR };
+	static const int s51[]    = { AERON_SPEAKER_FL,  AERON_SPEAKER_FR, AERON_SPEAKER_FC,
+								  AERON_SPEAKER_LFE, AERON_SPEAKER_BL, AERON_SPEAKER_BR };
+	static const int s71[]    = { AERON_SPEAKER_FL, AERON_SPEAKER_FR, AERON_SPEAKER_FC, AERON_SPEAKER_LFE,
+								  AERON_SPEAKER_BL, AERON_SPEAKER_BR, AERON_SPEAKER_SL, AERON_SPEAKER_SR };
+	switch (channels) {
+		case 1:
+			return mono;
+		case 2:
+			return stereo;
+		case 4:
+			return quad;
+		case 6:
+			return s51;
+		default:
+			return s71;
+	}
+}
+
+/* Builds a source-channel -> device-channel gain matrix. Speakers present in
+ * both layouts map directly; a missing speaker folds into its nearest
+ * neighbours at -3 dB. LFE is dropped when the device has no LFE channel.
+ * Mono and stereo sources keep their historical full-gain front mapping. */
+static void Aeron_AudioBuildChannelMatrix(int src_channels, int dst_channels,
+										  float matrix[AERON_AUDIO_MAX_CHANNELS][AERON_AUDIO_MAX_CHANNELS]) {
+	const float fold = 0.70710678f;
+	int         dst_index[AERON_SPEAKER_COUNT];
+	const int*  src_speakers = Aeron_AudioLayoutSpeakers(src_channels);
+	const int*  dst_speakers = Aeron_AudioLayoutSpeakers(dst_channels);
+
+	memset(matrix, 0, sizeof(float) * AERON_AUDIO_MAX_CHANNELS * AERON_AUDIO_MAX_CHANNELS);
+	if (src_channels == 1) {
+		matrix[0][0] = 1.0f;
+		matrix[0][1] = 1.0f;
+		return;
+	}
+	for (int i = 0; i < AERON_SPEAKER_COUNT; ++i) {
+		dst_index[i] = -1;
+	}
+	for (int c = 0; c < dst_channels; ++c) {
+		dst_index[dst_speakers[c]] = c;
+	}
+
+	for (int c = 0; c < src_channels; ++c) {
+		const int speaker = src_speakers[c];
+		if (dst_index[speaker] >= 0) {
+			matrix[c][dst_index[speaker]] = 1.0f;
+			continue;
+		}
+		switch (speaker) {
+			case AERON_SPEAKER_FC:
+				matrix[c][0] = fold;
+				matrix[c][1] = fold;
+				break;
+			case AERON_SPEAKER_BL:
+			case AERON_SPEAKER_SL:
+			case AERON_SPEAKER_BR:
+			case AERON_SPEAKER_SR: {
+				const int left      = speaker == AERON_SPEAKER_BL || speaker == AERON_SPEAKER_SL;
+				const int alternate = speaker == AERON_SPEAKER_BL   ? AERON_SPEAKER_SL
+									  : speaker == AERON_SPEAKER_SL ? AERON_SPEAKER_BL
+									  : speaker == AERON_SPEAKER_BR ? AERON_SPEAKER_SR
+																	: AERON_SPEAKER_BR;
+				if (dst_index[alternate] >= 0) {
+					matrix[c][dst_index[alternate]] = 1.0f;
+				} else {
+					matrix[c][left ? 0 : 1] = fold;
+				}
+				break;
+			}
+			default:
+				break; /* LFE without a subwoofer channel. */
+		}
+	}
+}
+
 static void Aeron_AudioMixStream(AeronAudioStreamSlot* stream, int frames) {
 	const double old_position = stream->read_position;
 	const double step         = (double)stream->rate / (double)AERON_AUDIO_DEVICE_RATE;
+	const int    src_channels = stream->channels;
+	const int    dst_channels = g_audio.device_channels;
 	int          mixed        = 0;
+	float        matrix[AERON_AUDIO_MAX_CHANNELS][AERON_AUDIO_MAX_CHANNELS];
 
+	Aeron_AudioBuildChannelMatrix(src_channels, dst_channels, matrix);
 	Aeron_AudioStreamUpdateAudibleLocked(stream, SDL_GetTicksNS());
 	for (int i = 0; i < frames; ++i) {
 		uint64_t i0;
 		uint64_t i1;
 		float    fraction;
-		float    left;
-		float    right;
+		float*   out = &g_audio.mix[(size_t)i * (size_t)dst_channels];
 
 		if (stream->read_position >= (double)stream->write_frame) {
 			break;
@@ -429,20 +530,14 @@ static void Aeron_AudioMixStream(AeronAudioStreamSlot* stream, int frames) {
 			i1 = i0;
 		}
 		fraction = (float)(stream->read_position - (double)i0);
-		if (stream->channels >= 2) {
-			const float l0 = Aeron_AudioSampleStream(stream, i0, 0);
-			const float l1 = Aeron_AudioSampleStream(stream, i1, 0);
-			const float r0 = Aeron_AudioSampleStream(stream, i0, 1);
-			const float r1 = Aeron_AudioSampleStream(stream, i1, 1);
-			left           = l0 + (l1 - l0) * fraction;
-			right          = r0 + (r1 - r0) * fraction;
-		} else {
-			const float s0 = Aeron_AudioSampleStream(stream, i0, 0);
-			const float s1 = Aeron_AudioSampleStream(stream, i1, 0);
-			left = right = s0 + (s1 - s0) * fraction;
+		for (int c = 0; c < src_channels; ++c) {
+			const float s0     = Aeron_AudioSampleStream(stream, i0, c);
+			const float s1     = Aeron_AudioSampleStream(stream, i1, c);
+			const float sample = (s0 + (s1 - s0) * fraction) * stream->gain;
+			for (int d = 0; d < dst_channels; ++d) {
+				out[d] += sample * matrix[c][d];
+			}
 		}
-		g_audio.mix[i * 2] += left * stream->gain;
-		g_audio.mix[i * 2 + 1] += right * stream->gain;
 		stream->read_position += step;
 		if (stream->read_position > (double)stream->write_frame) {
 			stream->read_position = (double)stream->write_frame;
@@ -463,7 +558,8 @@ static void Aeron_AudioMixStream(AeronAudioStreamSlot* stream, int frames) {
 static void Aeron_AudioMixChunk(int frames) {
 	SDL_LockMutex(g_audio.lock);
 
-	memset(g_audio.mix, 0, (size_t)frames * 2 * sizeof(float));
+	const int channels = g_audio.device_channels;
+	memset(g_audio.mix, 0, (size_t)frames * (size_t)channels * sizeof(float));
 
 	uint64_t played = Aeron_AudioPlayedOutputFramesLocked();
 	for (int v = 0; v < AERON_AUDIO_MAX_VOICES; ++v) {
@@ -488,7 +584,7 @@ static void Aeron_AudioMixChunk(int frames) {
 	float master = g_audio.master_gain;
 	SDL_UnlockMutex(g_audio.lock);
 
-	for (int i = 0; i < frames * 2; ++i) {
+	for (int i = 0; i < frames * channels; ++i) {
 		float sample = g_audio.mix[i] * master;
 		if (sample > 32767.0f) {
 			sample = 32767.0f;
@@ -505,12 +601,12 @@ static void SDLCALL Aeron_AudioCallback(void* userdata, SDL_AudioStream* stream,
 	(void)userdata;
 	(void)total_amount;
 
-	int frames_remaining = additional_amount / (AERON_AUDIO_DEVICE_CHANNELS * (int)sizeof(int16_t));
+	const int frame_bytes      = g_audio.device_channels * (int)sizeof(int16_t);
+	int       frames_remaining = additional_amount / frame_bytes;
 	while (frames_remaining > 0) {
 		int chunk = frames_remaining < AERON_AUDIO_MIX_CHUNK ? frames_remaining : AERON_AUDIO_MIX_CHUNK;
 		Aeron_AudioMixChunk(chunk);
-		SDL_PutAudioStreamData(stream, g_audio.stage,
-							   chunk * AERON_AUDIO_DEVICE_CHANNELS * (int)sizeof(int16_t));
+		SDL_PutAudioStreamData(stream, g_audio.stage, chunk * frame_bytes);
 		SDL_LockMutex(g_audio.lock);
 		g_audio.submitted_frames += (uint64_t)chunk;
 		SDL_UnlockMutex(g_audio.lock);
@@ -519,6 +615,42 @@ static void SDLCALL Aeron_AudioCallback(void* userdata, SDL_AudioStream* stream,
 }
 
 /* --- lifecycle ----------------------------------------------------------- */
+
+/* Opens the default playback device with g_audio.device_channels channels.
+ * SDL converts the stream to the hardware layout, so a surround mix still
+ * plays (downmixed) on a stereo device. */
+static int Aeron_AudioOpenDevice(int resume) {
+	SDL_AudioSpec spec;
+	spec.format   = SDL_AUDIO_S16;
+	spec.channels = g_audio.device_channels;
+	spec.freq     = AERON_AUDIO_DEVICE_RATE;
+
+	g_audio.device =
+		SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, Aeron_AudioCallback, NULL);
+	if (!g_audio.device) {
+		Aeron_LogError("aeron.audio", "SDL_OpenAudioDeviceStream failed: %s", SDL_GetError());
+		return 0;
+	}
+	g_audio.device_id                  = SDL_GetAudioStreamDevice(g_audio.device);
+	g_audio.device_buffer_input_frames = 0;
+	if (g_audio.device_id) {
+		SDL_AudioSpec actual;
+		int           sample_frames = 0;
+		if (SDL_GetAudioDeviceFormat(g_audio.device_id, &actual, &sample_frames) && actual.freq > 0 &&
+			sample_frames > 0) {
+			g_audio.device_buffer_input_frames =
+				(int)(((int64_t)sample_frames * AERON_AUDIO_DEVICE_RATE + actual.freq - 1) / actual.freq);
+		}
+	}
+
+	if (resume && !SDL_ResumeAudioStreamDevice(g_audio.device)) {
+		Aeron_LogError("aeron.audio", "SDL_ResumeAudioStreamDevice failed: %s", SDL_GetError());
+	}
+
+	Aeron_LogInfo("aeron.audio", "audio device opened: %d Hz, %d ch, S16 buffer=%d frames",
+				  AERON_AUDIO_DEVICE_RATE, g_audio.device_channels, g_audio.device_buffer_input_frames);
+	return 1;
+}
 
 int Aeron_AudioInit(void) {
 	memset(&g_audio, 0, sizeof(g_audio));
@@ -540,41 +672,55 @@ int Aeron_AudioInit(void) {
 		return 0;
 	}
 
-	SDL_AudioSpec spec;
-	spec.format   = SDL_AUDIO_S16;
-	spec.channels = AERON_AUDIO_DEVICE_CHANNELS;
-	spec.freq     = AERON_AUDIO_DEVICE_RATE;
-
-	g_audio.device =
-		SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, Aeron_AudioCallback, NULL);
-	if (!g_audio.device) {
-		Aeron_LogError("aeron.audio", "SDL_OpenAudioDeviceStream failed: %s", SDL_GetError());
+	g_audio.device_channels = AERON_AUDIO_DEFAULT_CHANNELS;
+	if (!Aeron_AudioOpenDevice(1)) {
 		SDL_DestroyCondition(g_audio.stream_space_available);
 		g_audio.stream_space_available = NULL;
 		SDL_DestroyMutex(g_audio.lock);
 		g_audio.lock = NULL;
 		return 0;
 	}
-	g_audio.device_id = SDL_GetAudioStreamDevice(g_audio.device);
-	if (g_audio.device_id) {
-		SDL_AudioSpec actual;
-		int           sample_frames = 0;
-		if (SDL_GetAudioDeviceFormat(g_audio.device_id, &actual, &sample_frames) && actual.freq > 0 &&
-			sample_frames > 0) {
-			g_audio.device_buffer_input_frames =
-				(int)(((int64_t)sample_frames * AERON_AUDIO_DEVICE_RATE + actual.freq - 1) / actual.freq);
-		}
-	}
-
-	if (!SDL_ResumeAudioStreamDevice(g_audio.device)) {
-		Aeron_LogError("aeron.audio", "SDL_ResumeAudioStreamDevice failed: %s", SDL_GetError());
-	}
 
 	g_audio.initialized = 1;
-	Aeron_LogInfo("aeron.audio", "audio device opened: %d Hz, %d ch, S16 buffer=%d frames",
-				  AERON_AUDIO_DEVICE_RATE, AERON_AUDIO_DEVICE_CHANNELS, g_audio.device_buffer_input_frames);
 	return 1;
 }
+
+int Aeron_AudioSetOutputChannels(int channels) {
+	int previous;
+
+	if (!g_audio.initialized || !Aeron_AudioLayoutSupported(channels) || channels < 2) {
+		return 0;
+	}
+	if (channels == g_audio.device_channels) {
+		return 1;
+	}
+
+	/* Destroying the device stream stops the callback, so the mixer layout can
+	 * change without racing it. Voices, clips and queued streams are kept. */
+	SDL_DestroyAudioStream(g_audio.device);
+	g_audio.device = NULL;
+	previous       = g_audio.device_channels;
+
+	SDL_LockMutex(g_audio.lock);
+	g_audio.device_channels = channels;
+	SDL_UnlockMutex(g_audio.lock);
+	if (Aeron_AudioOpenDevice(!g_audio.device_paused)) {
+		return 1;
+	}
+
+	SDL_LockMutex(g_audio.lock);
+	g_audio.device_channels = previous;
+	SDL_UnlockMutex(g_audio.lock);
+	if (!Aeron_AudioOpenDevice(!g_audio.device_paused)) {
+		Aeron_LogError("aeron.audio", "could not restore the %d-channel audio device", previous);
+		SDL_LockMutex(g_audio.lock);
+		g_audio.initialized = 0;
+		SDL_UnlockMutex(g_audio.lock);
+	}
+	return 0;
+}
+
+int Aeron_AudioOutputChannels(void) { return g_audio.initialized ? g_audio.device_channels : 0; }
 
 void Aeron_AudioSetPaused(int paused) {
 	uint64_t now_ns;
@@ -1078,7 +1224,7 @@ AeronAudioStream Aeron_AudioStreamOpen(int rate, int channels, AeronPcmFormat fo
 	AeronAudioStream result = 0;
 	const int        bits   = format == AERON_PCM_U8 ? 8 : format == AERON_PCM_S16 ? 16 : 0;
 
-	if (!g_audio.initialized || rate <= 0 || (channels != 1 && channels != 2) || bits == 0 ||
+	if (!g_audio.initialized || rate <= 0 || !Aeron_AudioLayoutSupported(channels) || bits == 0 ||
 		capacity_frames == 0 || capacity_frames > SIZE_MAX / ((size_t)channels * (size_t)(bits / 8))) {
 		return 0;
 	}

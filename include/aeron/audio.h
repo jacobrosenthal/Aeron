@@ -131,6 +131,18 @@ uint64_t Aeron_AudioStreamAudibleFrames(AeronAudioStream stream);
 uint64_t Aeron_AudioStreamUnderrunCount(AeronAudioStream stream);
 void     Aeron_AudioStreamClose(AeronAudioStream stream);
 
+/* Output layout ------------------------------------------------------------
+ *
+ * The device opens as stereo. Supported layouts use SDL channel order:
+ *   2: FL FR   4: FL FR BL BR   6: FL FR FC LFE BL BR   8: 6 + SL SR
+ * Changing the layout reopens the device on the control thread; clips, voices
+ * and queued streams survive. Voices and 1/2-channel streams play on the front
+ * pair. Queued streams may use 1, 2, 4, 6 or 8 channels; speakers absent from
+ * the device fold into their neighbours. Returns zero on failure, leaving the
+ * previous layout active. */
+int Aeron_AudioSetOutputChannels(int channels);
+int Aeron_AudioOutputChannels(void);
+
 /* Master ------------------------------------------------------------------ */
 
 void Aeron_AudioSetMasterGain(float gain);
