@@ -82,6 +82,7 @@ typedef struct AeronAudioSystem {
 	int               device_paused;
 	uint64_t          device_paused_ns;
 	SDL_Mutex*        lock;
+	SDL_Mutex*        device_lock; /* held while the device stream is replaced */
 	SDL_Condition*    stream_space_available;
 	uint64_t          submitted_frames; /* includes silence mixed after a voice ends */
 
@@ -102,9 +103,15 @@ typedef struct AeronAudioSystem {
 
 static AeronAudioSystem g_audio;
 
-/* Both locks are required for output-clock snapshots. */
+/* Both locks are required for output-clock snapshots. device_lock keeps the
+ * device stream alive across a layout change; the SDL callback never takes it. */
 static int Aeron_AudioLockOutput(void) {
-	if (!g_audio.initialized || !SDL_LockAudioStream(g_audio.device)) {
+	if (!g_audio.initialized) {
+		return 0;
+	}
+	SDL_LockMutex(g_audio.device_lock);
+	if (!g_audio.initialized || !g_audio.device || !SDL_LockAudioStream(g_audio.device)) {
+		SDL_UnlockMutex(g_audio.device_lock);
 		return 0;
 	}
 	SDL_LockMutex(g_audio.lock);
@@ -114,6 +121,7 @@ static int Aeron_AudioLockOutput(void) {
 static void Aeron_AudioUnlockOutput(void) {
 	SDL_UnlockMutex(g_audio.lock);
 	SDL_UnlockAudioStream(g_audio.device);
+	SDL_UnlockMutex(g_audio.device_lock);
 }
 
 static uint64_t Aeron_AudioPlayedOutputFramesLocked(void) {
@@ -664,9 +672,18 @@ int Aeron_AudioInit(void) {
 		Aeron_LogError("aeron.audio", "SDL_CreateMutex failed: %s", SDL_GetError());
 		return 0;
 	}
+	g_audio.device_lock = SDL_CreateMutex();
+	if (!g_audio.device_lock) {
+		Aeron_LogError("aeron.audio", "SDL_CreateMutex failed: %s", SDL_GetError());
+		SDL_DestroyMutex(g_audio.lock);
+		g_audio.lock = NULL;
+		return 0;
+	}
 	g_audio.stream_space_available = SDL_CreateCondition();
 	if (!g_audio.stream_space_available) {
 		Aeron_LogError("aeron.audio", "SDL_CreateCondition failed: %s", SDL_GetError());
+		SDL_DestroyMutex(g_audio.device_lock);
+		g_audio.device_lock = NULL;
 		SDL_DestroyMutex(g_audio.lock);
 		g_audio.lock = NULL;
 		return 0;
@@ -676,6 +693,8 @@ int Aeron_AudioInit(void) {
 	if (!Aeron_AudioOpenDevice(1)) {
 		SDL_DestroyCondition(g_audio.stream_space_available);
 		g_audio.stream_space_available = NULL;
+		SDL_DestroyMutex(g_audio.device_lock);
+		g_audio.device_lock = NULL;
 		SDL_DestroyMutex(g_audio.lock);
 		g_audio.lock = NULL;
 		return 0;
@@ -697,6 +716,7 @@ int Aeron_AudioSetOutputChannels(int channels) {
 
 	/* Destroying the device stream stops the callback, so the mixer layout can
 	 * change without racing it. Voices, clips and queued streams are kept. */
+	SDL_LockMutex(g_audio.device_lock);
 	SDL_DestroyAudioStream(g_audio.device);
 	g_audio.device = NULL;
 	previous       = g_audio.device_channels;
@@ -705,6 +725,7 @@ int Aeron_AudioSetOutputChannels(int channels) {
 	g_audio.device_channels = channels;
 	SDL_UnlockMutex(g_audio.lock);
 	if (Aeron_AudioOpenDevice(!g_audio.device_paused)) {
+		SDL_UnlockMutex(g_audio.device_lock);
 		return 1;
 	}
 
@@ -717,6 +738,7 @@ int Aeron_AudioSetOutputChannels(int channels) {
 		g_audio.initialized = 0;
 		SDL_UnlockMutex(g_audio.lock);
 	}
+	SDL_UnlockMutex(g_audio.device_lock);
 	return 0;
 }
 
@@ -788,8 +810,10 @@ void Aeron_AudioShutdown(void) {
 
 	/* Destroying the device stream pauses + unbinds it, so the callback cannot
 	 * run again before we tear down the tables. */
+	SDL_LockMutex(g_audio.device_lock);
 	SDL_DestroyAudioStream(g_audio.device);
 	g_audio.device = NULL;
+	SDL_UnlockMutex(g_audio.device_lock);
 
 	/* Producers have joined before the device and sample storage are released. */
 	SDL_LockMutex(g_audio.lock);
@@ -820,7 +844,9 @@ void Aeron_AudioShutdown(void) {
 	SDL_DestroyCondition(g_audio.stream_space_available);
 	g_audio.stream_space_available = NULL;
 	SDL_DestroyMutex(g_audio.lock);
-	g_audio.lock        = NULL;
+	g_audio.lock = NULL;
+	SDL_DestroyMutex(g_audio.device_lock);
+	g_audio.device_lock = NULL;
 	g_audio.initialized = 0;
 }
 
